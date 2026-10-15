@@ -8,7 +8,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" id="theme-color-meta" content="#07090c">
-<title>RegRally THOR v0.96.03</title>
+<title>RegRally THOR v0.96.04</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 /* ── THEME TOKENS ── */
@@ -1272,7 +1272,7 @@ body{
     <button id="theme-btn" onclick="toggleTheme()" style="background:none;border:none;cursor:pointer;padding:2px;line-height:1;display:flex;align-items:center;justify-content:center;" title="Toggle theme">
       <svg id="theme-btn-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--warn);"></svg>
     </button>
-    <div class="app-version">RegRally THOR v0.96.03</div>
+    <div class="app-version">RegRally THOR v0.96.04</div>
   </div>
 </div>
 
@@ -1343,6 +1343,9 @@ body{
       <div class="gdp-cell"><div class="gdp-lbl">Accuracy</div><div class="gdp-val" id="gdp-acc">—</div></div>
       <div class="gdp-cell"><div class="gdp-lbl">Speed</div><div class="gdp-val" id="gdp-spd">—</div></div>
       <div class="gdp-cell"><div class="gdp-lbl">Heading</div><div class="gdp-val" id="gdp-hdg">—</div></div>
+      <div class="gdp-cell"><div class="gdp-lbl">Rejected Fixes</div><div class="gdp-val" id="gdp-rej">0</div></div>
+      <div class="gdp-cell"><div class="gdp-lbl">Resyncs / Restarts</div><div class="gdp-val" id="gdp-sync">0 / 0</div></div>
+      <div class="gdp-cell"><div class="gdp-lbl">Last Reject</div><div class="gdp-val" id="gdp-why">—</div></div>
     </div>
   </div>
 </div>
@@ -2263,7 +2266,38 @@ function gpsAccuracyWeight(accM){
 let lastGoodPos               = null; // last position accepted as a valid basis for GUARD checks (raw fix-to-fix, moves on every accepted/stationary fix)
 let lastAcceptedPosTimestamp  = -1;   // pos.timestamp (sensor time) of last accepted fix
 let lastAcceptedPerfNow       = -1;   // performance.now() when last fix was accepted
-let gpsRejectedFixCount       = 0;    // diagnostic counter, shown in GPS data panel
+let gpsRejectedFixCount       = 0;    // diagnostic counter (reset per stage)
+
+// ── v0.96.04 — lock-out recovery ("distance stops counting") ──
+// Root cause found in field reports: every guard above compares a new fix
+// against lastGoodPos / lastAcceptedPosTimestamp, and a REJECTED fix never
+// moves those baselines. That is right for a single glitch, but it means any
+// event that makes the baseline permanently "wrong" locks the filter out
+// for good — every later fix is also compared against the stale baseline
+// and also rejected, so distance silently freezes until the page is
+// refreshed. Triggers: (a) a GPS gap long enough that the car is now >200m
+// from lastGoodPos (tunnel/canopy/receiver hiccup — 'raw-distance' forever);
+// (b) one fix carrying a timestamp ahead of the real clock, or the system
+// clock being stepped back (e.g. network time sync) — 'stale-timestamp'
+// forever. The same stale state also survived across stages, which is why
+// a stage could start and never count at all.
+// Recovery: after GPS_RESYNC_MIN_REJECTS consecutive rejections spanning at
+// least GPS_RESYNC_MIN_GAP_MS since the last accepted fix, the filter
+// re-baselines on the current fix (a lone glitch is followed by good fixes
+// that get accepted, so it never reaches this). For gap/timestamp-type
+// rejections the straight-line distance covered meanwhile is credited when
+// the implied average speed is plausible, since the car really did travel it.
+const GPS_RESYNC_MIN_REJECTS      = 5;
+const GPS_RESYNC_MIN_GAP_MS       = 3000;
+const GPS_WATCH_RESTART_MS        = 8000;   // watchPosition silent this long → tear down and re-create the watch
+const GPS_WATCH_RESTART_COOLDOWN_MS = 10000;
+let gpsConsecRejects     = 0;      // consecutive rejected fixes since the last accepted one
+let gpsResyncCount       = 0;      // diagnostic: filter re-baselines this session
+let gpsRejectedTotal     = 0;      // diagnostic: rejected fixes this session (not reset per stage)
+let gpsLastRejectReason  = '—';
+let gpsWatchRestarts     = 0;      // diagnostic: watch re-creations this session
+let lastWatchRestartTs   = -1e9;
+let gpsForceRebaseline   = false;  // set at stage start: next fix becomes a fresh baseline (clears any stale lock-out)
 
 // Returns {action:'accept'|'stationary'|'reject', reason?}
 // This function only asks "is this fix trustworthy, i.e. not a glitch?"
@@ -2344,6 +2378,19 @@ function smoothAlpha(accM){
 let distAnchorLat  = null, distAnchorLon = null; // dead-band anchor used for distance integration (separate from lastGoodPos)
 let distAnchorAccM = null;                       // accuracy (m) of the fix the anchor was last set/moved from
 
+// Hard re-baseline of every filter reference on the given fix. Credits no
+// distance by itself (callers decide that).
+function gpsRebaseline(pos){
+  const c = pos.coords;
+  lastGoodPos              = pos;
+  lastAcceptedPosTimestamp = pos.timestamp;
+  lastAcceptedPerfNow      = performance.now();
+  distAnchorLat            = c.latitude;
+  distAnchorLon            = c.longitude;
+  distAnchorAccM           = c.accuracy;
+  gpsConsecRejects         = 0;
+}
+
 function gpsSuccess(pos){
   gpsGranted = true;
   const c = pos.coords;
@@ -2355,7 +2402,7 @@ function gpsSuccess(pos){
   
   accumulatedFixesThisSec++;
   if(legRunning) totalFixesThisStage++;
-  if(lastGoodPos){
+  if(lastGoodPos && !gpsForceRebaseline){
     const d = haversine(lastGoodPos.coords.latitude,lastGoodPos.coords.longitude,c.latitude,c.longitude);
     const sensorDtSec  = (pos.timestamp - lastAcceptedPosTimestamp) / 1000;
     const perfNowGapMs = currentTimeStamp - lastAcceptedPerfNow;
@@ -2375,7 +2422,16 @@ function gpsSuccess(pos){
       // slow real motion (e.g. 15km/h) is never permanently zeroed out,
       // just credited a few fixes later than at cruise/higher speed.
       let dReleased = 0;
-      if(!dopplerStationary){
+      // v0.96.04: if the receiver's Doppler speed is stuck at ~0 (some
+      // providers/bridges report speed=0 permanently) the car would never
+      // count a metre. Position is far from the anchor by much more than any
+      // plausible jitter → believe the position over the speed.
+      let dopplerStuck = false;
+      if(dopplerStationary){
+        const dA = haversine(distAnchorLat, distAnchorLon, c.latitude, c.longitude);
+        if(dA >= Math.max(2.5 * motionJitterFloorM(c.accuracy, distAnchorAccM), 12)) dopplerStuck = true;
+      }
+      if(!dopplerStationary || dopplerStuck){
         const dFromAnchor = haversine(distAnchorLat, distAnchorLon, c.latitude, c.longitude);
         const floorM = motionJitterFloorM(c.accuracy, distAnchorAccM);
         if(dFromAnchor >= floorM){
@@ -2413,6 +2469,7 @@ function gpsSuccess(pos){
       lastGoodPos              = pos;
       lastAcceptedPosTimestamp = pos.timestamp;
       lastAcceptedPerfNow      = currentTimeStamp;
+      gpsConsecRejects         = 0;
     } else {
       // Reject this fix for distance purposes and DO NOT advance the
       // baseline — the next fix is compared against the last known-good
@@ -2421,15 +2478,40 @@ function gpsSuccess(pos){
       // check below) still updates as normal — only distance accumulation
       // is gated, so the UI never "freezes" while a bad fix is filtered.
       gpsRejectedFixCount++;
+      gpsRejectedTotal++;
+      gpsConsecRejects++;
+      gpsLastRejectReason = cls.reason;
       console.warn('GPS fix rejected ['+cls.reason+'] (dist='+d.toFixed(1)+'m, acc='+c.accuracy+'m, total rejected='+gpsRejectedFixCount+')');
+
+      // v0.96.04 lock-out recovery (see notes above gpsRebaseline callers)
+      const sinceAcceptMs = currentTimeStamp - lastAcceptedPerfNow;
+      const fixUsable = !(isFinite(c.accuracy) && c.accuracy > GPS_MAX_ACCURACY_M);
+      if(gpsConsecRejects >= GPS_RESYNC_MIN_REJECTS && sinceAcceptMs >= GPS_RESYNC_MIN_GAP_MS
+         && fixUsable && cls.reason !== 'burst-interval'){
+        // Gap/timestamp-type rejections mean the baseline is merely OLD, not
+        // that this fix is wrong — the car genuinely covered the straight-
+        // line distance since. Credit it if the implied average speed over
+        // the wall-clock gap is plausible. Speed/Doppler/accuracy-type
+        // rejections get a re-baseline only (no credit): those are the
+        // signature of a position teleport, not of lost time.
+        const gapType = cls.reason === 'raw-distance' || cls.reason === 'stale-timestamp' || cls.reason === 'bad-sensor-dt';
+        let credited = 0;
+        if(gapType && (d / (sinceAcceptMs/1000)) <= GPS_MAX_PLAUSIBLE_SPEED_MS) credited = d;
+        if(credited > 0){
+          const cfR = legRunning ? getCalibFactor() : 1.0;
+          if(legRunning) gpsDistM += credited / cfR;
+          const tripR = credited / getCalibFactor();
+          if(!tripPaused)  tripDistM  += tripR;
+          if(!trip2Paused) trip2DistM += tripR;
+        }
+        gpsResyncCount++;
+        console.warn('GPS filter RESYNC #'+gpsResyncCount+' after '+gpsConsecRejects+' rejects / '+(sinceAcceptMs/1000).toFixed(1)+'s ['+cls.reason+'], credited '+credited.toFixed(1)+'m');
+        gpsRebaseline(pos);
+      }
     }
   } else {
-    lastGoodPos              = pos;
-    lastAcceptedPosTimestamp = pos.timestamp;
-    lastAcceptedPerfNow      = currentTimeStamp;
-    distAnchorLat            = c.latitude;
-    distAnchorLon            = c.longitude;
-    distAnchorAccM           = c.accuracy;
+    gpsRebaseline(pos);
+    gpsForceRebaseline = false;
   }
   
   if(lastHzIntervalCheckTs == null) {
@@ -2445,20 +2527,26 @@ function gpsSuccess(pos){
   
   lastPos = pos;
   
-  gel('hdr-gps-fixes').textContent = currentFixRateHz.toFixed(1) + '/s';
-  gel('hdr-gps-acc').textContent = '±' + c.accuracy.toFixed(2) + 'm';
-  gel('hdr-gps-spd').textContent = gpsSpeedMs != null ? (gpsSpeedMs * 3.6).toFixed(1) + 'km/h' : '0.0km/h';
-  gel('hdr-gps-alt').textContent = c.altitude != null ? c.altitude.toFixed(1) + 'm' : '—';
-  gel('hdr-gps-hz').textContent = currentFixRateHz.toFixed(0) + 'Hz';
+  // v0.96.04: UI refresh is isolated so a display glitch (e.g. a receiver
+  // reporting accuracy=null → .toFixed throws) can never abort gpsSuccess
+  // before the sub-leg auto-advance / auto-stop logic below.
+  try{
+    const accTxt = (c.accuracy != null && isFinite(c.accuracy)) ? c.accuracy : 0;
+    gel('hdr-gps-fixes').textContent = currentFixRateHz.toFixed(1) + '/s';
+    gel('hdr-gps-acc').textContent = '±' + accTxt.toFixed(2) + 'm';
+    gel('hdr-gps-spd').textContent = gpsSpeedMs != null ? (gpsSpeedMs * 3.6).toFixed(1) + 'km/h' : '0.0km/h';
+    gel('hdr-gps-alt').textContent = c.altitude != null ? c.altitude.toFixed(1) + 'm' : '—';
+    gel('hdr-gps-hz').textContent = currentFixRateHz.toFixed(0) + 'Hz';
 
-  // GPS data panel on Legs page — updated here on every GPS fix
-  updateGpsDataPanel(c);
+    // GPS data panel on Legs page — updated here on every GPS fix
+    updateGpsDataPanel(c);
 
-  const banner=gel('li-gps-status');
-  if(banner){banner.className='li-gps';banner.textContent='✓ GPS active — ±'+c.accuracy.toFixed(1)+'m';}
-  updateGpsBtns('granted');
-  const ov=gel('gps-overlay');
-  if(!ov.classList.contains('hidden')){ ov.classList.add('hidden'); ov.style.display='none'; }
+    const banner=gel('li-gps-status');
+    if(banner){banner.className='li-gps';banner.textContent='✓ GPS active — ±'+accTxt.toFixed(1)+'m';}
+    updateGpsBtns('granted');
+    const ov=gel('gps-overlay');
+    if(!ov.classList.contains('hidden')){ ov.classList.add('hidden'); ov.style.display='none'; }
+  }catch(uiErr){ console.warn('GPS UI refresh error', uiErr); }
 
   if(legRunning && legs[curIdx]){
     const activeLeg = legs[curIdx];
@@ -2497,6 +2585,9 @@ function updateGpsDataPanel(c){
     setGdp('gdp-acc', '±'+c.accuracy.toFixed(1)+'m', false);
     setGdp('gdp-spd', gpsSpeedMs != null ? (gpsSpeedMs*3.6).toFixed(1)+' km/h' : '—', gpsSpeedMs==null);
     setGdp('gdp-hdg', c.heading   != null ? c.heading.toFixed(1)+'°'   : '—', c.heading==null);
+    setGdp('gdp-rej',  String(gpsRejectedTotal), gpsRejectedTotal===0);
+    setGdp('gdp-sync', gpsResyncCount+' / '+gpsWatchRestarts, gpsResyncCount===0 && gpsWatchRestarts===0);
+    setGdp('gdp-why',  gpsLastRejectReason, gpsLastRejectReason==='—');
   } else {
     if(dot) dot.className = 'gdp-dot';
     ['gdp-lat','gdp-lon','gdp-alt','gdp-acc','gdp-spd','gdp-hdg'].forEach(id => setGdp(id,'—', true));
@@ -2518,6 +2609,11 @@ setInterval(()=>{
   if(lastPos) updateGpsDataPanel(lastPos.coords);
   if(gpsGranted && lastFixTime != null){
     const silentMs = performance.now() - lastFixTime;
+    // v0.96.04: a watch that has silently stopped delivering (no success
+    // AND no error callback — seen when the browser suspends/throttles the
+    // page or the location provider hiccups) never recovers by itself, so
+    // distance stays frozen until a manual refresh. Re-create it.
+    if(silentMs > GPS_WATCH_RESTART_MS && watchId !== null) restartGpsWatch('silent '+(silentMs/1000).toFixed(0)+'s');
     if(silentMs > GPS_STALE_MS){
       currentFixRateHz = 0;
       gel('hdr-gps-fixes').textContent = '0/s';
@@ -2567,6 +2663,45 @@ function gpsError(err){
     }
   }
 }
+
+// Tears down and re-creates the geolocation watch (rate-limited). Only acts
+// when GPS was granted and a watch exists, so it never interferes with the
+// permission flow or with "Continue without GPS".
+function restartGpsWatch(reason){
+  if(!('geolocation' in navigator) || !gpsGranted || watchId === null) return;
+  const nowT = performance.now();
+  if(nowT - lastWatchRestartTs < GPS_WATCH_RESTART_COOLDOWN_MS) return;
+  lastWatchRestartTs = nowT;
+  gpsWatchRestarts++;
+  console.warn('GPS watch RESTART #'+gpsWatchRestarts+' ('+reason+')');
+  try{ navigator.geolocation.clearWatch(watchId); }catch(e){}
+  watchId = navigator.geolocation.watchPosition(gpsSuccess,gpsError,{enableHighAccuracy:true,timeout:10000,maximumAge:0});
+}
+
+// Page lifecycle (v0.96.04): when the page returns to the foreground the
+// watch may have been suspended — check immediately instead of waiting for
+// the watchdog — and keep the screen awake while the rally UI is open
+// (a sleeping screen is a common reason for a suspended watch).
+let _wakeLock = null;
+async function requestWakeLock(){
+  try{
+    if('wakeLock' in navigator && document.visibilityState === 'visible' && !_wakeLock){
+      _wakeLock = await navigator.wakeLock.request('screen');
+      _wakeLock.addEventListener('release', ()=>{ _wakeLock = null; });
+    }
+  }catch(e){ _wakeLock = null; }
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible'){
+    requestWakeLock();
+    if(gpsGranted && lastFixTime != null && performance.now() - lastFixTime > 2000) restartGpsWatch('page visible');
+  }
+});
+window.addEventListener('pageshow', ()=>{
+  requestWakeLock();
+  if(gpsGranted && lastFixTime != null && performance.now() - lastFixTime > 2000) restartGpsWatch('pageshow');
+});
+requestWakeLock();
 
 function doRequestGPS(){
   if(!('geolocation' in navigator)){updateGpsBtns('unsupported');return;}
@@ -3575,6 +3710,12 @@ function startLeg(){
   if(legRunning) return;
   legRunning=true; legStartTs=performance.now();
   gpsDistM=0; gpsFixN=0; totalAccPointsThisStage=0; gpsRejectedFixCount=0; totalFixesThisStage=0;
+  // v0.96.04: every stage starts from a fresh GPS filter baseline — the next
+  // fix re-anchors everything — so a stale lock-out left over from before
+  // the start can't make a stage count nothing. Also make sure the watch
+  // itself is still delivering.
+  gpsForceRebaseline = true; gpsConsecRejects = 0;
+  if(gpsGranted && lastFixTime != null && performance.now() - lastFixTime > 3000) restartGpsWatch('stage start, no fixes for '+((performance.now()-lastFixTime)/1000).toFixed(0)+'s');
   // New random GUID + fresh sub-event buffer for this run — see legResults notes.
   currentRunId = genGuid();
   curRunSubEvents = [];
